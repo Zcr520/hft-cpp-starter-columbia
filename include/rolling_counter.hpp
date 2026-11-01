@@ -1,16 +1,67 @@
 #pragma once
+
+#include <cstddef>
 #include <cstdint>
-// HW8 — sliding-window event counter. count() is called with a non-decreasing clock.
-//
-// Edge case that costs most people a test (see labs/week08.md step 5): ts_ns and
-// now_ns are UNSIGNED. Early on, now_ns <= window_ns and the mathematical cutoff
-// (now - window) is negative — there is no uint64_t that means that, and there is
-// no safe value to clamp it to. Only compute the subtraction when it is
-// meaningful; do not expire anything before then.
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
+// Week 8: exact sliding-window event count.
+// Precondition: timestamps passed to add() are non-decreasing; count(now) is
+// non-decreasing, and added timestamps are not in the future relative to now.
+// A timestamp is live precisely when now - window < ts <= now.
+// This class is single-threaded; external synchronization is required if shared.
 struct RollingCounter {
-    explicit RollingCounter(uint64_t window_ns) { (void)window_ns;
-        // TODO(student): ring/deque of timestamps; amortized O(1).
+    explicit RollingCounter(std::uint64_t window_ns)
+        : window_(window_ns), buf_(kInitialCapacity) {}
+
+    // O(1) with preallocated capacity; amortized O(1) even when it grows.
+    void add(std::uint64_t ts_ns) {
+        if (tail_ - head_ == buf_.size()) {
+            grow(); // rare safety fallback: never overwrite a live timestamp
+        }
+        buf_[tail_ & (buf_.size() - 1)] = ts_ns;
+        ++tail_;
     }
-    void add(uint64_t ts_ns) { (void)ts_ns; /* TODO(student) */ }
-    uint64_t count(uint64_t now_ns) { (void)now_ns; return 0; /* TODO: events with ts > now-window */ }
+
+    // O(k+1), where k is the number of events expired by this call.
+    // Each event expires at most once => O(1) amortized over the stream.
+    std::uint64_t count(std::uint64_t now_ns) {
+        // The strict boundary is ts > now - window.
+        // Do NOT subtract while now < window: uint64_t would underflow.
+        // Equality DOES have cutoff zero: ts==0 must expire at now==window.
+        if (now_ns >= window_) {
+            const std::uint64_t cutoff = now_ns - window_;
+            const std::size_t mask = buf_.size() - 1;
+            while (head_ != tail_ && buf_[head_ & mask] <= cutoff) {
+                ++head_;
+            }
+        }
+        return static_cast<std::uint64_t>(tail_ - head_);
+    }
+
+private:
+    static constexpr std::size_t kInitialCapacity = std::size_t{1} << 20;
+    static_assert((kInitialCapacity & (kInitialCapacity - 1)) == 0,
+                  "Ring capacity must be a power of two");
+
+    std::uint64_t window_;
+    std::vector<std::uint64_t> buf_; // contiguous, preallocated timestamp ring
+    std::size_t head_ = 0;          // logical indices, not physical positions
+    std::size_t tail_ = 0;
+
+    void grow() {
+        const std::size_t old_capacity = buf_.size();
+        if (old_capacity > std::numeric_limits<std::size_t>::max() / 2) {
+            throw std::length_error("RollingCounter capacity overflow");
+        }
+        const std::size_t live = tail_ - head_;
+        std::vector<std::uint64_t> larger(old_capacity * 2);
+        for (std::size_t i = 0; i < live; ++i) {
+            larger[i] = buf_[(head_ + i) & (old_capacity - 1)];
+        }
+        buf_.swap(larger);
+        head_ = 0;
+        tail_ = live;
+    }
 };
